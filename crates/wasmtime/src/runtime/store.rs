@@ -76,6 +76,8 @@
 //! contents of `StoreOpaque`. This is an invariant that we, as the authors of
 //! `wasmtime`, must uphold for the public interface to be safe.
 
+#[cfg(all(feature = "debug", feature = "async"))]
+use crate::DebugHandler;
 use crate::RootSet;
 use crate::error::OutOfMemory;
 #[cfg(feature = "async")]
@@ -95,7 +97,7 @@ use crate::runtime::vm::{
 };
 use crate::trampoline::VMHostGlobalContext;
 #[cfg(feature = "debug")]
-use crate::{BreakpointState, DebugHandler, FrameDataCache};
+use crate::{BreakpointState, FrameDataCache, SyncDebugHandler};
 use crate::{Engine, Module, Val, ValRaw, module::ModuleRegistry};
 #[cfg(feature = "gc")]
 use crate::{ExnRef, Rooted, ThrownException};
@@ -270,13 +272,18 @@ pub struct StoreInner<T: 'static> {
     /// `&self` and also the whole Store mutably (via
     /// `StoreContextMut`); so we need to hold a separate reference to
     /// it while invoking it.
-    #[cfg(feature = "debug")]
+    #[cfg(all(feature = "debug", feature = "async"))]
     debug_handler: Option<Box<dyn StoreDebugHandler<T>>>,
+
+    /// The user's synchronous debug handler, if any. See
+    /// [`crate::SyncDebugHandler`] for more documentation.
+    #[cfg(feature = "debug")]
+    sync_debug_handler: Option<Box<dyn StoreSyncDebugHandler<T>>>,
 }
 
 /// Adapter around `DebugHandler` that gets monomorphized into an
 /// object-safe dyn trait to place in `store.debug_handler`.
-#[cfg(feature = "debug")]
+#[cfg(all(feature = "debug", feature = "async"))]
 trait StoreDebugHandler<T: 'static>: Send + Sync {
     fn handle<'a>(
         self: Box<Self>,
@@ -285,7 +292,7 @@ trait StoreDebugHandler<T: 'static>: Send + Sync {
     ) -> Box<dyn Future<Output = ()> + Send + 'a>;
 }
 
-#[cfg(feature = "debug")]
+#[cfg(all(feature = "debug", feature = "async"))]
 impl<D> StoreDebugHandler<D::Data> for D
 where
     D: DebugHandler,
@@ -305,6 +312,32 @@ where
         // callsite, put it back now that we've cloned it.
         store.0.debug_handler = Some(self);
         Box::new(async move { handler.handle(store, event).await })
+    }
+}
+
+/// Adapter around `SyncDebugHandler` that gets monomorphized into an
+/// object-safe dyn trait to place in `store.sync_debug_handler`.
+#[cfg(feature = "debug")]
+trait StoreSyncDebugHandler<T: 'static>: Send + Sync {
+    fn handle<'a>(self: Box<Self>, store: StoreContextMut<'a, T>, event: crate::DebugEvent<'a>);
+}
+
+#[cfg(feature = "debug")]
+impl<D> StoreSyncDebugHandler<D::Data> for D
+where
+    D: SyncDebugHandler,
+{
+    fn handle<'a>(
+        self: Box<Self>,
+        store: StoreContextMut<'a, D::Data>,
+        event: crate::DebugEvent<'a>,
+    ) {
+        // Clone the underlying `SyncDebugHandler` for the same reason as the
+        // async handler above: the handler is stored inside the store but also
+        // receives a mutable borrow of the whole store.
+        let handler: D = (*self).clone();
+        store.0.sync_debug_handler = Some(self);
+        handler.handle(store, event);
     }
 }
 
@@ -792,8 +825,10 @@ impl<T> Store<T> {
             #[cfg(target_has_atomic = "64")]
             epoch_deadline_behavior: None,
             data_no_provenance: ManuallyDrop::new(data),
-            #[cfg(feature = "debug")]
+            #[cfg(all(feature = "debug", feature = "async"))]
             debug_handler: None,
+            #[cfg(feature = "debug")]
+            sync_debug_handler: None,
         })?;
 
         let store_data =
@@ -1294,7 +1329,7 @@ impl<T> Store<T> {
     ///
     /// - Will panic if guest-debug support was not enabled via
     ///   [`crate::Config::guest_debug`].
-    #[cfg(feature = "debug")]
+    #[cfg(all(feature = "debug", feature = "async"))]
     pub fn set_debug_handler(&mut self, handler: impl DebugHandler<Data = T>)
     where
         // We require `Send` here because the debug handler becomes
@@ -1317,14 +1352,46 @@ impl<T> Store<T> {
             self.engine().tunables().debug_guest,
             "debug hooks require guest debugging to be enabled"
         );
+        self.inner.sync_debug_handler = None;
         self.inner.debug_handler = Some(Box::new(handler));
+    }
+
+    /// Set the synchronous debug callback on this store.
+    ///
+    /// See [`crate::SyncDebugHandler`] for more documentation.
+    ///
+    /// Unlike [`Store::set_debug_handler`], this does not require async Wasm
+    /// entrypoints and must not wait for external input.
+    ///
+    /// # Panics
+    ///
+    /// - Will panic if guest-debug support was not enabled via
+    ///   [`crate::Config::guest_debug`].
+    #[cfg(feature = "debug")]
+    pub fn set_sync_debug_handler(&mut self, handler: impl SyncDebugHandler<Data = T>) {
+        assert!(
+            self.engine().tunables().debug_guest,
+            "debug hooks require guest debugging to be enabled"
+        );
+        #[cfg(feature = "async")]
+        {
+            self.inner.debug_handler = None;
+        }
+        self.inner.sync_debug_handler = Some(Box::new(handler));
     }
 
     /// Clear the debug handler on this store. If any existed, it will
     /// be dropped.
-    #[cfg(feature = "debug")]
+    #[cfg(all(feature = "debug", feature = "async"))]
     pub fn clear_debug_handler(&mut self) {
         self.inner.debug_handler = None;
+    }
+
+    /// Clear the synchronous debug handler on this store. If any existed, it
+    /// will be dropped.
+    #[cfg(feature = "debug")]
+    pub fn clear_sync_debug_handler(&mut self) {
+        self.inner.sync_debug_handler = None;
     }
 
     /// Register a [`Module`] with this store's module registry for
@@ -2942,6 +3009,13 @@ unsafe impl<T> VMStore for StoreInner<T> {
 
     #[cfg(feature = "debug")]
     fn block_on_debug_handler(&mut self, event: crate::DebugEvent<'_>) -> crate::Result<()> {
+        if let Some(handler) = self.sync_debug_handler.take() {
+            log::trace!("about to raise synchronous debug event {event:?}");
+            handler.handle(StoreContextMut(self), event);
+            return Ok(());
+        }
+
+        #[cfg(feature = "async")]
         if let Some(handler) = self.debug_handler.take() {
             if !self.can_block() {
                 bail!("could not invoke debug handler without async context");
@@ -2949,10 +3023,10 @@ unsafe impl<T> VMStore for StoreInner<T> {
             log::trace!("about to raise debug event {event:?}");
             StoreContextMut(self).with_blocking(|store, cx| {
                 cx.block_on(Pin::from(handler.handle(store, event)).as_mut())
-            })
-        } else {
-            Ok(())
+            })?;
         }
+
+        Ok(())
     }
 }
 

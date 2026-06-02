@@ -5,8 +5,10 @@ use std::sync::{Arc, Mutex};
 use wasmtime::{
     AsContextMut, Caller, Config, DebugEvent, DebugHandler, Engine, Extern, FrameHandle, Func,
     Global, GlobalType, Inlining, Instance, Module, ModulePC, Mutability, Result, Store,
-    StoreContextMut, Val, ValType,
+    StoreContextMut, SyncDebugHandler, Val, ValType,
 };
+#[cfg(feature = "pulley")]
+use wasmtime_environ::TripleExt;
 
 use crate::async_functions::PollOnce;
 
@@ -592,6 +594,99 @@ macro_rules! debug_event_checker {
             }
         }
     }
+}
+
+#[cfg(feature = "pulley")]
+fn first_function_operator_offsets(wasm: &[u8]) -> Vec<u32> {
+    for payload in wasmparser::Parser::new(0).parse_all(wasm) {
+        let wasmparser::Payload::CodeSectionEntry(body) = payload.unwrap() else {
+            continue;
+        };
+        let mut reader = body.get_operators_reader().unwrap();
+        let mut offsets = Vec::new();
+        while !reader.eof() {
+            let pos = reader.original_position();
+            reader.read().unwrap();
+            offsets.push(u32::try_from(pos).unwrap());
+        }
+        return offsets;
+    }
+    panic!("expected a function body")
+}
+
+#[test]
+#[cfg(feature = "pulley")]
+#[cfg_attr(miri, ignore)]
+fn sync_debug_handler_can_single_step_without_async() -> wasmtime::Result<()> {
+    #[derive(Clone)]
+    struct Trace(Arc<Mutex<Vec<(u32, Vec<i32>, Vec<i32>)>>>);
+
+    impl SyncDebugHandler for Trace {
+        type Data = ();
+
+        fn handle(&self, mut store: StoreContextMut<'_, ()>, event: DebugEvent<'_>) {
+            let DebugEvent::Breakpoint = event else {
+                return;
+            };
+
+            let frame = store.debug_exit_frames().next().unwrap();
+            let (_func, pc) = frame
+                .wasm_function_index_and_pc(&mut store)
+                .unwrap()
+                .unwrap();
+            let locals = (0..frame.num_locals(&mut store).unwrap())
+                .map(|i| frame.local(&mut store, i).unwrap().unwrap_i32())
+                .collect();
+            let stack = (0..frame.num_stacks(&mut store).unwrap())
+                .map(|i| frame.stack(&mut store, i).unwrap().unwrap_i32())
+                .collect();
+
+            self.0.lock().unwrap().push((pc.raw(), locals, stack));
+        }
+    }
+
+    let wasm = wat::parse_str(
+        r#"
+        (module
+          (func (export "main") (param i32) (result i32)
+            (local i32)
+            local.get 0
+            local.set 1
+            local.get 1
+            i32.const 1
+            i32.add))
+        "#,
+    )
+    .unwrap();
+    let expected_pcs = first_function_operator_offsets(&wasm);
+
+    let mut config = Config::default();
+    config.guest_debug(true);
+    config.target(&target_lexicon::Triple::pulley_host().to_string())?;
+    let engine = Engine::new(&config)?;
+    let module = Module::new(&engine, &wasm)?;
+    let mut store = Store::new(&engine, ());
+    let trace = Arc::new(Mutex::new(Vec::new()));
+    store.set_sync_debug_handler(Trace(trace.clone()));
+    store.edit_breakpoints().unwrap().single_step(true)?;
+
+    let instance = Instance::new(&mut store, &module, &[])?;
+    let func = instance.get_typed_func::<i32, i32>(&mut store, "main")?;
+    assert_eq!(func.call(&mut store, 7)?, 8);
+
+    let trace = trace.lock().unwrap();
+    assert_eq!(
+        trace.iter().map(|(pc, _, _)| *pc).collect::<Vec<_>>(),
+        expected_pcs
+    );
+    assert_eq!(trace[0].1, vec![7, 0]);
+    assert!(trace[0].2.is_empty());
+    assert_eq!(trace[2].1, vec![7, 7]);
+    assert!(trace[2].2.is_empty());
+    assert_eq!(trace[3].2, vec![7]);
+    assert_eq!(trace[4].2, vec![7, 1]);
+
+    Ok(())
 }
 
 #[tokio::test]

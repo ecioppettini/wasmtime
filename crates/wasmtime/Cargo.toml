@@ -439,7 +439,6 @@ component-model-async-bytes = [
 # Enables support for guest debugging.
 debug = [
     'runtime',
-    'async'
 ]
 
 # Enables support for defining compile-time builtins.

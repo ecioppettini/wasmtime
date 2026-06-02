@@ -929,6 +929,7 @@ pub enum DebugEvent<'a> {
 ///       suspend point in the handler.
 ///
 /// [`Store::run_concurrent`]: crate::Store::run_concurrent
+#[cfg(feature = "async")]
 pub trait DebugHandler: Clone + Send + Sync + 'static {
     /// The data expected on the store that this handler is attached
     /// to.
@@ -940,6 +941,22 @@ pub trait DebugHandler: Clone + Send + Sync + 'static {
         store: StoreContextMut<'_, Self::Data>,
         event: DebugEvent<'_>,
     ) -> impl Future<Output = ()> + Send;
+}
+
+/// A synchronous handler for debug events.
+///
+/// This is similar to the asynchronous debug handler, except it does not return
+/// a future and therefore does not require running Wasm through async
+/// entrypoints. This is intended for handlers that can do their work
+/// immediately, such as tracing, and should not wait for external debugger
+/// input.
+pub trait SyncDebugHandler: Clone + Send + Sync + 'static {
+    /// The data expected on the store that this handler is attached
+    /// to.
+    type Data;
+
+    /// Handle a debug event.
+    fn handle(&self, store: StoreContextMut<'_, Self::Data>, event: DebugEvent<'_>);
 }
 
 /// Breakpoint state for modules within a store.

@@ -522,6 +522,19 @@ impl CodeMemory {
             return Ok(());
         }
 
+        // Pulley bytecode is stored in the text section but is not native
+        // executable code. On targets without virtual memory (e.g. wasm32 in
+        // the browser) publishing such an image did not change memory
+        // protections, so unpublishing it does not need to either. The private
+        // store-local copy used for guest debugging remains writable and can be
+        // patched directly.
+        if !self.mmap.supports_virtual_memory()
+            && !self.needs_executable
+            && !self.mmap.is_always_readonly()
+        {
+            return Ok(());
+        }
+
         if !self.mmap.supports_virtual_memory() {
             bail!("this target requires virtual memory to be enabled");
         }
